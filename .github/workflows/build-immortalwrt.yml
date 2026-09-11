@@ -91,15 +91,17 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # Avoid the SDK's mosdns package shadowing the version in this fork.
+          # Avoid SDK packages shadowing the versions selected for this build.
           ./scripts/feeds uninstall mosdns || true
+          ./scripts/feeds uninstall v2ray-geodata || true
           package_dir="$SDK_DIR/package/MosDNS"
           mkdir -p "$package_dir"
           cp -a "$GITHUB_WORKSPACE/luci-app-mosdns" "$package_dir/"
           cp -a "$GITHUB_WORKSPACE/mosdns" "$package_dir/"
           cp -a "$GITHUB_WORKSPACE/geo2txt" "$package_dir/"
+          # This repository is itself an OpenWrt package (not a MosDNS subfolder).
           git clone --depth=1 https://github.com/sbwml/v2ray-geodata.git \
-            "$package_dir/v2ray-geodata"
+            "$SDK_DIR/package/v2ray-geodata"
 
       - name: Configure selected packages
         env:
@@ -128,7 +130,7 @@ jobs:
           make --jobs="$(nproc)" V=s \
             package/MosDNS/mosdns/compile \
             package/MosDNS/geo2txt/compile \
-            package/MosDNS/v2ray-geodata/compile \
+            package/v2ray-geodata/compile \
             package/MosDNS/luci-app-mosdns/compile
 
       - name: Assemble installable package archive
