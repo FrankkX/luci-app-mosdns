@@ -1,0 +1,172 @@
+name: Build ImmortalWrt MosDNS packages
+
+run-name: Build MosDNS for ImmortalWrt 25.12.2 (${{ inputs.target }}/${{ inputs.subtarget }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "ImmortalWrt target, e.g. x86, armsr, mediatek, qualcommax"
+        required: true
+        default: "x86"
+        type: string
+      subtarget:
+        description: "ImmortalWrt subtarget, e.g. 64, armv8, filogic"
+        required: true
+        default: "64"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMMORTALWRT_VERSION: 25.12.2
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}/${{ inputs.subtarget }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential bison clang curl file flex g++ gawk gettext git \
+            libelf-dev libncurses-dev libssl-dev python3 python3-pyelftools \
+            python3-setuptools rsync swig unzip wget zlib1g-dev zstd
+
+      - name: Download and verify the ImmortalWrt SDK
+        id: sdk
+        env:
+          TARGET: ${{ inputs.target }}
+          SUBTARGET: ${{ inputs.subtarget }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VERSION}/targets/${TARGET}/${SUBTARGET}"
+          download_dir="${RUNNER_TEMP}/immortalwrt-sdk-${TARGET}-${SUBTARGET}"
+          mkdir -p "$download_dir"
+          cd "$download_dir"
+
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --output sha256sums "${base_url}/sha256sums"
+          mapfile -t sdk_files < <(awk '
+            { file = $2; sub(/^\*/, "", file) }
+            file ~ /^immortalwrt-sdk-/ && file ~ /\.Linux-x86_64\.tar\.zst$/ { print file }
+          ' sha256sums)
+          if [[ "${#sdk_files[@]}" -ne 1 ]]; then
+            echo "::error::Could not find exactly one SDK at ${base_url}"
+            exit 1
+          fi
+
+          sdk_file="${sdk_files[0]}"
+          awk -v file="$sdk_file" '
+            { name = $2; sub(/^\*/, "", name) }
+            name == file { print $1 "  " file; found = 1 }
+            END { exit !found }
+          ' sha256sums > sdk.sha256
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --output "$sdk_file" "${base_url}/${sdk_file}"
+          sha256sum --check sdk.sha256
+          tar --use-compress-program=unzstd --extract --file "$sdk_file"
+
+          sdk_dir="$(find "$download_dir" -mindepth 1 -maxdepth 1 -type d -name 'immortalwrt-sdk-*' -print -quit)"
+          [[ -n "$sdk_dir" ]] || { echo "::error::SDK extraction failed"; exit 1; }
+          echo "path=$sdk_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Add MosDNS packages and their data dependency
+        env:
+          SDK_DIR: ${{ steps.sdk.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # Avoid the SDK's mosdns package shadowing the version in this fork.
+          ./scripts/feeds uninstall mosdns || true
+          package_dir="$SDK_DIR/package/MosDNS"
+          mkdir -p "$package_dir"
+          cp -a "$GITHUB_WORKSPACE/luci-app-mosdns" "$package_dir/"
+          cp -a "$GITHUB_WORKSPACE/mosdns" "$package_dir/"
+          cp -a "$GITHUB_WORKSPACE/geo2txt" "$package_dir/"
+          git clone --depth=1 https://github.com/sbwml/v2ray-geodata.git \
+            "$package_dir/v2ray-geodata"
+
+      - name: Configure selected packages
+        env:
+          SDK_DIR: ${{ steps.sdk.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_mosdns=m
+          CONFIG_PACKAGE_geo2txt=m
+          CONFIG_PACKAGE_v2ray-geoip=m
+          CONFIG_PACKAGE_v2ray-geosite=m
+          CONFIG_PACKAGE_luci-app-mosdns=m
+          CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=m
+          EOF
+          make defconfig
+
+      - name: Compile APK packages
+        env:
+          SDK_DIR: ${{ steps.sdk.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          make --jobs="$(nproc)" V=s \
+            package/MosDNS/mosdns/compile \
+            package/MosDNS/geo2txt/compile \
+            package/MosDNS/v2ray-geodata/compile \
+            package/MosDNS/luci-app-mosdns/compile
+
+      - name: Assemble installable package archive
+        id: artifacts
+        env:
+          SDK_DIR: ${{ steps.sdk.outputs.path }}
+          TARGET: ${{ inputs.target }}
+          SUBTARGET: ${{ inputs.subtarget }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$GITHUB_WORKSPACE/dist/immortalwrt-${IMMORTALWRT_VERSION}-${TARGET}-${SUBTARGET}"
+          package_dir="$artifact_dir/packages"
+          mkdir -p "$package_dir"
+          find "$SDK_DIR/bin" -type f \( \
+            -name 'mosdns-*.apk' -o -name 'geo2txt-*.apk' -o \
+            -name 'v2ray-geoip-*.apk' -o -name 'v2ray-geosite-*.apk' -o \
+            -name 'luci-app-mosdns-*.apk' -o -name 'luci-i18n-mosdns-zh-cn*.apk' \
+          \) -exec cp {} "$package_dir/" \;
+
+          [[ -n "$(find "$package_dir" -type f -name 'mosdns-*.apk' -print -quit)" ]] || {
+            echo "::error::MosDNS APK was not produced"; exit 1;
+          }
+          find "$package_dir" -maxdepth 1 -type f -printf '%f\n' | sort > "$artifact_dir/packages.txt"
+          tar --create --gzip --file "$artifact_dir/mosdns-immortalwrt-${IMMORTALWRT_VERSION}-${TARGET}-${SUBTARGET}.tar.gz" \
+            -C "$artifact_dir" packages packages.txt
+          (
+            cd "$artifact_dir"
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+          echo "path=$artifact_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-immortalwrt-${{ env.IMMORTALWRT_VERSION }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          path: ${{ steps.artifacts.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
